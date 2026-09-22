@@ -186,6 +186,37 @@ struct CanvasFixtureGenerator {
         try encoder.encode(entries).write(to: root.appendingPathComponent("index.json"))
         print("FIXTURES_WRITTEN \(entries.count) \(root.path)")
     }
+    // MARK: motion blur — direction and distance, beyond the default the set covers
+
+    static let motionPath = ProcessInfo.processInfo.environment["COMP_FIXTURE_MOTION"]
+
+    /// The set's `adjust/motionBlur` is the default (0°, distance 10): a horizontal streak, every tap on a pixel centre.
+    /// These turn the streak off-axis (taps between pixels) and lengthen it, over a disc on the gradient so the blur
+    /// meets both an alpha edge and the canvas edge. Written to their own group and index, so the main set — whose
+    /// seeded kinds would re-seed — is left alone.
+    @Test(.enabled(if: motionPath != nil)) func writeTheMotionFixtures() async throws {
+        let root = URL(fileURLWithPath: try #require(Self.motionPath))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var entries: [Entry] = []
+        let variants: [(name: String, angle: Double, distance: Double)] = [
+            ("angle0-d30", 0, 30), ("angle45-d20", 45, 20), ("angle90-d15", 90, 15),
+            ("angle-30-d25", -30, 25), ("angle60-d4", 60, 4),
+        ]
+        for v in variants {
+            let s = EditorSession(); s.createDocument(width: Self.side, height: Self.side)
+            s.insert(try base()); s.insert(try disc()); s.addAdjustment(.motionBlur)
+            let id = try #require(s.activeLayerID)
+            var value = try #require(s.activeLayer?.adjustment)
+            value.resolvedMotionAngle = v.angle; value.resolvedMotionDistance = v.distance
+            s.updateAdjustment(id, value: value)
+            _ = try await write(s, v.name, "motion", ["adjustment:motionBlur", "motion:angle=\(v.angle)", "motion:distance=\(v.distance)"],
+                                into: root, &entries)
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(entries).write(to: root.appendingPathComponent("index-motion.json"))
+        print("MOTION_FIXTURES_WRITTEN \(entries.count) \(root.path)")
+    }
+
     // MARK: verification — are the committed oracles reproducible from their saved documents?
 
     static let verifyPath = ProcessInfo.processInfo.environment["COMP_FIXTURE_VERIFY"]
