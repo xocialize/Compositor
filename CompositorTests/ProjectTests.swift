@@ -11,6 +11,15 @@ struct ProjectTests {
         return url
     }
 
+    /// The writer and the reader have to agree about the format version. Saving encodes
+    /// `ProjectManifest.current`, and `load` rejects anything outside `ProjectManifest.supported`, so a
+    /// `current` outside `supported` means the app cannot reopen its own documents. That shipped once:
+    /// the version went to 9 while the package-header check stayed at 1...8, and every round-trip test
+    /// below failed with `.version(9)`. This catches the same mistake without touching the disk.
+    @Test func theCurrentFormatVersionIsOneTheReaderAccepts() {
+        #expect(ProjectManifest.supported.contains(ProjectManifest.current))
+    }
+
     @Test func projectRoundTripSurvivesSourceRemovalAndPackageMove() async throws {
         let root = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: root) }
