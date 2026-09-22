@@ -24,9 +24,10 @@ struct CanvasFixtureGenerator {
         /// True when the oracle is byte-identical to the same document without the feature under test —
         /// i.e. the fixture does not actually exercise it. Recorded, not hidden.
         var identicalToControl: Bool? = nil
-        /// False where Compositor renders with fresh randomness each time — the oracle cannot anchor an exact
-        /// comparison, only a statistical one. Measured by generating the set twice (AB-R, P0 step 3b).
-        var oracleDeterministic = true
+        /// True where the layer picks a random seed at creation (`addAdjustment`) and saves it. The oracle is a
+        /// function of the saved file — `committedOraclesReproduceFromTheirDocuments` — but regenerating the set makes
+        /// new layers with new seeds. (Rev 1 of this field claimed the render itself was random; it is not.)
+        var seededAtCreation: Bool? = nil
     }
 
     /// Adjustment kinds whose defaults are an identity (or within 1 LSB of one) get settings that move pixels,
@@ -43,7 +44,7 @@ struct CanvasFixtureGenerator {
         }
         return true
     }
-    /// Compositor draws these with new randomness on every render.
+    /// These pick a random seed when the layer is created, and save it.
     static let randomKinds: Set<AdjustmentKind> = [.grain, .addNoise]
 
     // MARK: images
@@ -176,7 +177,7 @@ struct CanvasFixtureGenerator {
                 s.updateAdjustment(id, value: value); features[1] = "settings:tuned"
             }
             _ = try await write(s, String(describing: kind), "adjust", features, into: root, &entries, control: baseOnly) { e in
-                e.oracleDeterministic = !Self.randomKinds.contains(kind)
+                if Self.randomKinds.contains(kind) { e.seededAtCreation = true }
             }
         }
 
@@ -184,6 +185,28 @@ struct CanvasFixtureGenerator {
         try encoder.encode(entries).write(to: root.appendingPathComponent("index.json"))
         print("FIXTURES_WRITTEN \(entries.count) \(root.path)")
     }
+    // MARK: verification — are the committed oracles reproducible from their saved documents?
+
+    static let verifyPath = ProcessInfo.processInfo.environment["COMP_FIXTURE_VERIFY"]
+
+    /// Loads every committed fixture with the app's own loader, re-exports it with the app's own exporter, and
+    /// byte-compares against the committed oracle. Tests "is the oracle a function of the file", which regenerating
+    /// the set does not — regeneration makes new layers, and new adjustment layers pick new noise seeds.
+    @Test(.enabled(if: verifyPath != nil)) func committedOraclesReproduceFromTheirDocuments() async throws {
+        let root = URL(fileURLWithPath: try #require(Self.verifyPath))
+        let index = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("index.json"))) as? [[String: Any]])
+        var same = 0, differ: [String] = []
+        for e in index {
+            let group = e["group"] as! String, name = e["name"] as! String
+            let snapshot = try await ProjectStore.shared.load(from: root.appendingPathComponent("\(group)/\(name).comp"))
+            let png = try await ImageExporter.shared.pngData(snapshot)
+            let stored = try Data(contentsOf: root.appendingPathComponent(e["oracle"] as! String))
+            if png == stored { same += 1 } else { differ.append("\(group)/\(name)") }
+        }
+        print("ORACLE_REPRODUCIBLE \(same)/\(index.count) differ: \(differ.isEmpty ? "none" : differ.joined(separator: ", "))")
+        #expect(differ.isEmpty)
+    }
+
     // MARK: latency subject (gate 2) — never committed; ~1 GB of layer PNGs
 
     static let largePath = ProcessInfo.processInfo.environment["COMP_FIXTURE_LARGE"]
