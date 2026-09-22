@@ -184,4 +184,76 @@ struct CanvasFixtureGenerator {
         try encoder.encode(entries).write(to: root.appendingPathComponent("index.json"))
         print("FIXTURES_WRITTEN \(entries.count) \(root.path)")
     }
+    // MARK: latency subject (gate 2) — never committed; ~1 GB of layer PNGs
+
+    static let largePath = ProcessInfo.processInfo.environment["COMP_FIXTURE_LARGE"]
+
+    private func bigImage(_ w: Int, _ h: Int, _ f: (Double, Double) -> (Double, Double, Double, Double)) throws -> ImportedImage {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = try #require(CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let px = try #require(ctx.data).assumingMemoryBound(to: UInt8.self)
+        for y in 0..<h { for x in 0..<w {
+            let (r, g, b, a) = f(Double(x) / Double(w - 1), Double(y) / Double(h - 1)); let i = (y * w + x) * 4
+            px[i] = UInt8((r * a * 255).rounded()); px[i+1] = UInt8((g * a * 255).rounded())
+            px[i+2] = UInt8((b * a * 255).rounded()); px[i+3] = UInt8((a * 255).rounded())
+        } }
+        let img = try #require(ctx.makeImage())
+        return ImportedImage(image: img, thumbnail: img, name: "Large")
+    }
+
+    /// Latency subjects — as large as the .comp format allows. It caps a document at 100 MP of layer pixels in
+    /// total (`ProjectStore.checkSize`), so a 24 MP document holds at most 4 full-canvas layers.
+    static let latencySubjects: [(name: String, w: Int, h: Int, layers: Int)] = [
+        ("latency-24mp-4layers", 6000, 4000, 4),
+        ("latency-4k-10layers", 3840, 2560, 10),
+    ]
+
+    @Test(.enabled(if: largePath != nil)) func writeTheLatencySubjects() async throws {
+        let root = URL(fileURLWithPath: try #require(Self.largePath))
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        var facts: [[String: Any]] = []
+        for subject in Self.latencySubjects {
+            let (w, h) = (subject.w, subject.h)
+            let s = EditorSession(); s.createDocument(width: w, height: h)
+            s.insert(try bigImage(w, h) { x, y in (x, y, 0.5, 1) })                                       // backdrop
+            let modes: [LayerBlendMode] = [.multiply, .screen, .overlay, .softLight, .colorDodge, .linearBurn, .hue]
+            let structure = subject.layers >= 6          // room for a folder + clip stack at the end
+            let plain = subject.layers - 1 - (structure ? 2 : 0)
+            for i in 0..<plain {
+                let k = Double(i) / Double(max(1, plain))
+                s.insert(try bigImage(w, h) { x, y in (fmod(x + k, 1), 1 - y, fmod(y + k, 1), x > 0.8 ? 0.6 : 1) })
+                s.setLayerBlendMode(modes[i % modes.count])
+                if i == 1 { s.setSelection(ellipse(w, h), name: "Ellipse"); s.addMask(); s.setSelection(nil, name: "Deselect") }
+            }
+            if structure {
+                s.addGroup(); s.setLayerOpacity(0.7)                                                     // folder at 70%
+                s.insert(try bigImage(w, h) { x, y in hypot(x - 0.5, y - 0.5) < 0.3 ? (0.9, 0.4, 0.1, 1) : (0, 0, 0, 0) })
+                s.insert(try bigImage(w, h) { x, y in (y, x, 1 - x, 1) }); s.setLayerBlendMode(.multiply)
+                let clipped = try #require(s.activeLayerID); s.toggleClippingMask(clipped)                 // clip stack
+            }
+            let snapshot = try #require(s.projectSnapshot())
+            let pixelLayers = snapshot.manifest.layers.filter { $0.imageFile != nil }.count
+            #expect(pixelLayers == subject.layers, "\(subject.name): \(pixelLayers) pixel layers, wanted \(subject.layers)")
+            let url = root.appendingPathComponent("\(subject.name).comp")
+            try? FileManager.default.removeItem(at: url)
+            try await ProjectStore.shared.save(snapshot, to: url)
+            var times: [Double] = []
+            for _ in 0..<3 {
+                let t0 = Date(); _ = try await ImageExporter.shared.render(snapshot)
+                times.append(Date().timeIntervalSince(t0) * 1000)
+            }
+            times.sort()
+            facts.append(["name": subject.name, "width": w, "height": h, "pixelLayers": pixelLayers,
+                          "oracleRenderMs": times, "oracleMedianMs": times[1]])
+            print("LATENCY_SUBJECT \(subject.name) oracle median \(Int(times[1])) ms")
+        }
+        try JSONSerialization.data(withJSONObject: facts, options: [.prettyPrinted, .sortedKeys])
+            .write(to: root.appendingPathComponent("latency.json"))
+    }
+
+    private func ellipse(_ w: Int, _ h: Int) -> DocumentSelection {
+        DocumentSelection(path: CGPath(ellipseIn: CGRect(x: Double(w) * 0.2, y: Double(h) * 0.2, width: Double(w) * 0.6,
+                                                         height: Double(h) * 0.6), transform: nil), antialiased: true, feather: 40)
+    }
 }
