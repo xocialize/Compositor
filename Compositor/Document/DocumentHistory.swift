@@ -38,6 +38,10 @@ final class DocumentHistory {
     var isModified: Bool { revision != savedRevision }
     var undoCount: Int { past.count }
     func markSaved() { savedRevision = revision }
+    /// The document as it stands, for a save that captures it now and finishes later.
+    var currentRevision: UUID { revision }
+    /// A save of `saved` finished. Edits made while it was writing leave the document modified; undoing back to it doesn't.
+    func markSaved(_ saved: UUID) { savedRevision = saved }
     func reset() {
         past.removeAll()
         future.removeAll()
@@ -85,13 +89,17 @@ final class DocumentHistory {
         return entry.after
     }
 
+    /// Every image an asset holds: a 16-bit layer's 16-bit pixels too, twice the size of its 8-bit copy.
+    private static func images(of asset: ImportedImage) -> [CGImage] {
+        [asset.image, asset.thumbnail] + (asset.deep.map { [$0] } ?? [])
+    }
+
     /// Bytes retained only by history, excluding images in the live document.
     func retainedBytes(current: CanvasDocument?) -> Int {
         var seen = Set<ObjectIdentifier>()
         for layer in current?.layers ?? [] {
             for asset in [layer.asset, layer.mask?.asset].compactMap({ $0 }) {
-                seen.insert(ObjectIdentifier(asset.image))
-                seen.insert(ObjectIdentifier(asset.thumbnail))
+                for image in Self.images(of: asset) { seen.insert(ObjectIdentifier(image)) }
             }
         }
         var bytes = 0
@@ -99,7 +107,7 @@ final class DocumentHistory {
             for snapshot in [entry.before, entry.after] {
                 for layer in snapshot.document?.layers ?? [] {
                     for asset in [layer.asset, layer.mask?.asset].compactMap({ $0 }) {
-                        for image in [asset.image, asset.thumbnail] where seen.insert(ObjectIdentifier(image)).inserted {
+                        for image in Self.images(of: asset) where seen.insert(ObjectIdentifier(image)).inserted {
                             bytes += image.bytesPerRow * image.height
                         }
                     }

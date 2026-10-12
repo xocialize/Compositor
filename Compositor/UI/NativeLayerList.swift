@@ -41,7 +41,7 @@ struct NativeLayerList: NSViewRepresentable {
         if let table = scroll.documentView as? NSTableView { context.coordinator.update(table) }
     }
 
-    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
         static let layerType = NSPasteboard.PasteboardType("com.compositor.layer-row")
         /// An Option-drag from a mask thumbnail: the id of the layer whose mask is being copied.
         static let effectType = NSPasteboard.PasteboardType("com.compositor.layer-effect")
@@ -52,9 +52,12 @@ struct NativeLayerList: NSViewRepresentable {
         private var oldCollapsed: Set<UUID> = []
         private var editingEnabled = false
         private var synchronizing = false
+        private var activeLayerID: UUID?
         init(session: EditorSession) { self.session = session }
 
         func update(_ table: NSTableView) {
+            let selectionChanged = activeLayerID != session.activeLayerID
+            activeLayerID = session.activeLayerID
             let entries = session.layerRows
             let byID = Dictionary(uniqueKeysWithValues: (session.document?.layers ?? []).map { ($0.id, $0) })
             let next = entries.compactMap { byID[$0.layer.id] }
@@ -62,7 +65,7 @@ struct NativeLayerList: NSViewRepresentable {
             rowDetails = Dictionary(uniqueKeysWithValues: entries.map { ($0.layer.id, $0) })
             let expansionChanged = oldCollapsed != session.collapsedGroupIDs
             oldCollapsed = session.collapsedGroupIDs
-            let enabled = session.canEditLayers
+            let enabled = session.layersLookEditable
             synchronizing = true
             defer { synchronizing = false }
             let old = rows
@@ -72,9 +75,10 @@ struct NativeLayerList: NSViewRepresentable {
             if old.map(\.id) != next.map(\.id) {
                 table.reloadData()
             } else {
-                // Selection never reloads cells or recreates thumbnails.
+                // Selection never reloads cells or recreates thumbnails. A depth change can keep the very same picture
+                // (Convert to 16-Bit on an 8-bit layer), so its tag is compared too.
                 let changed = IndexSet(next.indices.filter {
-                    editableChanged || expansionChanged || (old[$0].name != next[$0].name || old[$0].isVisible != next[$0].isVisible || old[$0].size != next[$0].size || old[$0].parentID != next[$0].parentID || old[$0].isGroup != next[$0].isGroup || old[$0].asset?.image !== next[$0].asset?.image || (old[$0].liveText != nil) != (next[$0].liveText != nil) || old[$0].effects != next[$0].effects || old[$0].mask != next[$0].mask || old[$0].maskSourceID != next[$0].maskSourceID) || previousDetails[next[$0].id]?.depth != rowDetails[next[$0].id]?.depth || previousDetails[next[$0].id]?.visible != rowDetails[next[$0].id]?.visible
+                    editableChanged || expansionChanged || (old[$0].name != next[$0].name || old[$0].isVisible != next[$0].isVisible || old[$0].size != next[$0].size || old[$0].parentID != next[$0].parentID || old[$0].isGroup != next[$0].isGroup || old[$0].asset?.image !== next[$0].asset?.image || old[$0].depthLabel != next[$0].depthLabel || (old[$0].liveText != nil) != (next[$0].liveText != nil) || old[$0].effects != next[$0].effects || old[$0].mask != next[$0].mask || old[$0].maskSourceID != next[$0].maskSourceID) || previousDetails[next[$0].id]?.depth != rowDetails[next[$0].id]?.depth || previousDetails[next[$0].id]?.visible != rowDetails[next[$0].id]?.visible
                 })
                 let resized = IndexSet(next.indices.filter { (old[$0].effects?.kinds.count ?? 0) != (next[$0].effects?.kinds.count ?? 0) })
                 // Adding or removing an effect only changes how tall a row is. Left to AppKit that is animated, and
@@ -87,6 +91,10 @@ struct NativeLayerList: NSViewRepresentable {
             }
             let indices = IndexSet(next.indices.filter { session.selectedEffect == nil && session.selectedLayerIDs.contains(next[$0].id) })
             if table.selectedRowIndexes != indices { table.selectRowIndexes(indices, byExtendingSelection: false) }
+            // Reveal a newly selected layer, without undoing a manual scroll on later display updates.
+            if selectionChanged, let id = activeLayerID, let row = next.firstIndex(where: { $0.id == id }) {
+                table.scrollRowToVisible(row)
+            }
             // Border-only updates: selecting a target never rebuilds thumbnails or canvas pixels.
             let visible = table.rows(in: table.visibleRect)
             if visible.location != NSNotFound {
@@ -101,6 +109,254 @@ struct NativeLayerList: NSViewRepresentable {
                     (table.view(atColumn: 0, row: row, makeIfNecessary: true) as? LayerCell)?.beginRenaming()
                 }
             }
+        }
+
+        func layer(for row: Int) -> ImageLayer? {
+            guard rows.indices.contains(row) else { return nil }
+            return rows[row]
+        }
+
+        func contextMenu(for row: Int) -> NSMenu? {
+            guard rows.indices.contains(row) else { return nil }
+            if session.selectedLayerIDs.isEmpty {
+                session.selectLayer(rows[row].id)
+            }
+            let menu = NSMenu()
+
+            // 1. Duplicate Layer
+            let duplicateItem = NSMenuItem(title: "Duplicate Layer", action: #selector(duplicateLayerAction), keyEquivalent: "")
+            duplicateItem.target = self
+            duplicateItem.isEnabled = validateMenuItem(duplicateItem)
+            menu.addItem(duplicateItem)
+
+            // 2. Rename…
+            let renameItem = NSMenuItem(title: "Rename…", action: #selector(renameLayerAction), keyEquivalent: "")
+            renameItem.target = self
+            renameItem.isEnabled = validateMenuItem(renameItem)
+            menu.addItem(renameItem)
+
+            // 3. Delete Layer / Delete Selected Layers
+            let deleteTitle: String
+            if session.isMaskSelected && session.activeLayer?.mask != nil {
+                deleteTitle = "Delete Mask"
+            } else if session.selectedLayerIDs.count > 1 {
+                deleteTitle = "Delete Selected Layers"
+            } else {
+                deleteTitle = "Delete Layer"
+            }
+            let deleteItem = NSMenuItem(title: deleteTitle, action: #selector(deleteLayerAction), keyEquivalent: "")
+            deleteItem.target = self
+            deleteItem.isEnabled = validateMenuItem(deleteItem)
+            menu.addItem(deleteItem)
+
+            menu.addItem(NSMenuItem.separator())
+
+            // 4. Create Clipping Mask / Release Clipping Mask
+            let clippingTitle = session.activeLayer?.maskSourceID != nil ? "Release Clipping Mask" : "Create Clipping Mask"
+            let clippingItem = NSMenuItem(title: clippingTitle, action: #selector(toggleClippingMaskAction), keyEquivalent: "")
+            clippingItem.target = self
+            clippingItem.isEnabled = validateMenuItem(clippingItem)
+            menu.addItem(clippingItem)
+
+            // 5. Group Selected Layers
+            let groupItem = NSMenuItem(title: "Group Selected Layers", action: #selector(groupSelectedLayersAction), keyEquivalent: "")
+            groupItem.target = self
+            groupItem.isEnabled = validateMenuItem(groupItem)
+            menu.addItem(groupItem)
+
+            // A folder right-clicked can be ungrouped: its layers stay where they are, and the folder goes.
+            if rows[row].isGroup {
+                let ungroupItem = NSMenuItem(title: "Ungroup Layers", action: #selector(ungroupLayersAction), keyEquivalent: "")
+                ungroupItem.target = self
+                ungroupItem.isEnabled = validateMenuItem(ungroupItem)
+                menu.addItem(ungroupItem)
+            }
+
+            // 6. Move Out of Folder
+            let moveOutItem = NSMenuItem(title: "Move Out of Folder", action: #selector(moveOutOfFolderAction), keyEquivalent: "")
+            moveOutItem.target = self
+            moveOutItem.isEnabled = validateMenuItem(moveOutItem)
+            menu.addItem(moveOutItem)
+
+            // 7. Merge Down / Merge Layers / Merge Group
+            let mergeItem = NSMenuItem(title: session.mergeTitle, action: #selector(mergeLayersAction), keyEquivalent: "")
+            mergeItem.target = self
+            mergeItem.isEnabled = validateMenuItem(mergeItem)
+            menu.addItem(mergeItem)
+
+            // 7b. Convert to 16-Bit / Convert to 8-Bit
+            let depthTitle = session.activeLayer?.asset?.deep == nil ? "Convert to 16-Bit" : "Convert to 8-Bit"
+            let depthItem = NSMenuItem(title: depthTitle, action: #selector(convertDepthAction), keyEquivalent: "")
+            depthItem.target = self
+            depthItem.isEnabled = validateMenuItem(depthItem)
+            // An HDR layer can go to 16 bits as well as to 8.
+            if session.activeLayer?.asset?.isHDR == true {
+                let sixteenItem = NSMenuItem(title: "Convert to 16-Bit", action: #selector(convertHDRToSixteenAction), keyEquivalent: "")
+                sixteenItem.target = self
+                sixteenItem.isEnabled = validateMenuItem(sixteenItem)
+                menu.addItem(sixteenItem)
+            }
+            menu.addItem(depthItem)
+
+            menu.addItem(NSMenuItem.separator())
+
+            // 8. Add Mask >
+            let addMaskItem = NSMenuItem(title: "Add Mask", action: nil, keyEquivalent: "")
+            let addMaskSubmenu = NSMenu(title: "Add Mask")
+            let revealAllItem = NSMenuItem(title: "Reveal All (White)", action: #selector(addWhiteMaskAction), keyEquivalent: "")
+            revealAllItem.target = self
+            revealAllItem.isEnabled = validateMenuItem(revealAllItem)
+            addMaskSubmenu.addItem(revealAllItem)
+            let hideAllItem = NSMenuItem(title: "Hide All (Black)", action: #selector(addBlackMaskAction), keyEquivalent: "")
+            hideAllItem.target = self
+            hideAllItem.isEnabled = validateMenuItem(hideAllItem)
+            addMaskSubmenu.addItem(hideAllItem)
+            addMaskItem.submenu = addMaskSubmenu
+            addMaskItem.isEnabled = session.canEditMask && session.activeLayer?.mask == nil
+            menu.addItem(addMaskItem)
+
+            // 9. Enable Mask / Disable Mask
+            let toggleMaskTitle = session.activeLayer?.mask?.isEnabled == false ? "Enable Mask" : "Disable Mask"
+            let toggleMaskItem = NSMenuItem(title: toggleMaskTitle, action: #selector(toggleMaskAction), keyEquivalent: "")
+            toggleMaskItem.target = self
+            toggleMaskItem.isEnabled = validateMenuItem(toggleMaskItem)
+            menu.addItem(toggleMaskItem)
+
+            // 10. Delete Mask
+            let deleteMaskItem = NSMenuItem(title: "Delete Mask", action: #selector(deleteMaskAction), keyEquivalent: "")
+            deleteMaskItem.target = self
+            deleteMaskItem.isEnabled = validateMenuItem(deleteMaskItem)
+            menu.addItem(deleteMaskItem)
+
+            // 11. Link Mask / Unlink Mask
+            let linkMaskTitle = session.activeLayer?.mask?.isLinked == false ? "Link Mask" : "Unlink Mask"
+            let linkMaskItem = NSMenuItem(title: linkMaskTitle, action: #selector(toggleMaskLinkAction), keyEquivalent: "")
+            linkMaskItem.target = self
+            linkMaskItem.isEnabled = validateMenuItem(linkMaskItem)
+            menu.addItem(linkMaskItem)
+
+            menu.addItem(NSMenuItem.separator())
+
+            // 12. Hide Layer / Show Layer
+            let visibilityTitle = session.activeLayer?.isVisible == false ? "Show Layer" : "Hide Layer"
+            let visibilityItem = NSMenuItem(title: visibilityTitle, action: #selector(toggleVisibilityAction), keyEquivalent: "")
+            visibilityItem.target = self
+            visibilityItem.isEnabled = validateMenuItem(visibilityItem)
+            menu.addItem(visibilityItem)
+
+            return menu
+        }
+
+        func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+            switch menuItem.action {
+            case #selector(duplicateLayerAction):
+                return session.canEditLayers && session.activeLayer != nil
+            case #selector(renameLayerAction):
+                return session.canEditLayers && session.activeLayer != nil && session.selectedLayerIDs.count == 1
+            case #selector(deleteLayerAction):
+                return session.canEditLayers && session.activeLayer != nil
+            case #selector(toggleClippingMaskAction):
+                return session.activeLayerID.map { session.canToggleClippingMask($0) } ?? false
+            case #selector(groupSelectedLayersAction):
+                return session.canEditLayers && session.document != nil && (session.document?.layers.count ?? 0) < 10_000 && !session.selectedLayerIDs.isEmpty
+            case #selector(ungroupLayersAction):
+                return session.canUngroupLayers
+            case #selector(moveOutOfFolderAction):
+                return session.canEditLayers && session.activeLayer?.parentID != nil
+            case #selector(mergeLayersAction):
+                return session.canMergeLayers
+            case #selector(convertDepthAction), #selector(convertHDRToSixteenAction):
+                return session.canConvertLayerDepth
+            case #selector(addWhiteMaskAction), #selector(addBlackMaskAction):
+                return session.canEditMask && session.activeLayer?.mask == nil
+            case #selector(toggleMaskAction):
+                return session.canEditMask && session.activeLayer?.mask != nil
+            case #selector(deleteMaskAction):
+                return session.canEditMask && session.activeLayer?.mask != nil
+            case #selector(toggleMaskLinkAction):
+                return session.canEditLayers && session.activeLayer?.mask != nil && session.activeLayer?.isGroup == false && session.activeLayer?.adjustment == nil
+            case #selector(toggleVisibilityAction):
+                return session.canEditLayers && session.activeLayer != nil
+            default:
+                if menuItem.submenu != nil && menuItem.title == "Add Mask" {
+                    return session.canEditMask && session.activeLayer?.mask == nil
+                }
+                return true
+            }
+        }
+
+        @objc func duplicateLayerAction(_ sender: Any?) {
+            session.duplicateActiveLayer()
+        }
+
+        @objc func renameLayerAction(_ sender: Any?) {
+            guard session.canEditLayers, let id = session.activeLayerID else { return }
+            session.renamingLayerID = id
+        }
+
+        @objc func deleteLayerAction(_ sender: Any?) {
+            session.deleteLayerOrMask()
+        }
+
+        @objc func toggleClippingMaskAction(_ sender: Any?) {
+            if let id = session.activeLayerID { session.toggleClippingMask(id) }
+        }
+
+        @objc func groupSelectedLayersAction(_ sender: Any?) {
+            session.groupSelectedLayers()
+        }
+
+        @objc func ungroupLayersAction(_ sender: Any?) {
+            session.ungroupLayers()
+        }
+
+        @objc func moveOutOfFolderAction(_ sender: Any?) {
+            session.moveActiveLayerOutOfGroup()
+        }
+
+        @objc func mergeLayersAction(_ sender: Any?) {
+            session.mergeLayers()
+        }
+
+        @objc func convertDepthAction(_ sender: Any?) {
+            session.convertLayerDepth()
+        }
+
+        @objc func convertHDRToSixteenAction(_ sender: Any?) {
+            session.convertHDRToSixteenBit()
+        }
+
+        @objc func addWhiteMaskAction(_ sender: Any?) {
+            guard let id = session.activeLayerID else { return }
+            session.selectLayerTarget(id, mask: false)
+            session.addMask(revealing: true)
+        }
+
+        @objc func addBlackMaskAction(_ sender: Any?) {
+            guard let id = session.activeLayerID else { return }
+            session.selectLayerTarget(id, mask: false)
+            session.addMask(revealing: false)
+        }
+
+        @objc func toggleMaskAction(_ sender: Any?) {
+            guard let id = session.activeLayerID else { return }
+            session.selectLayerTarget(id, mask: false)
+            session.toggleLayerMask()
+        }
+
+        @objc func deleteMaskAction(_ sender: Any?) {
+            guard let id = session.activeLayerID else { return }
+            session.selectLayerTarget(id, mask: false)
+            session.deleteLayerMask()
+        }
+
+        @objc func toggleMaskLinkAction(_ sender: Any?) {
+            if let id = session.activeLayerID { session.toggleMaskLink(id) }
+        }
+
+        @objc func toggleVisibilityAction(_ sender: Any?) {
+            guard let id = session.activeLayerID else { return }
+            session.toggleLayerVisibility(id)
         }
 
         func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
@@ -260,6 +516,51 @@ final class LayerTableView: NSTableView {
     private var clippingTracking: NSTrackingArea?
     private var clippingMonitor: Any?
     private var clippingCursorActive = false
+
+    /// Cmd-A selects the whole canvas, as Select > All does, even with the Layers panel just clicked — never every layer.
+    /// A layer's name being edited keeps its own Select All: its field editor answers first.
+    override func selectAll(_ sender: Any?) {
+        guard let session = session ?? (delegate as? NativeLayerList.Coordinator)?.session, session.document != nil else { return }
+        session.selectAll()
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row = row(at: point)
+        guard row >= 0, row < numberOfRows else { return nil }
+        guard let coordinator = delegate as? NativeLayerList.Coordinator else { return nil }
+        guard let targetLayer = coordinator.layer(for: row) else { return nil }
+        let currentSession = session ?? coordinator.session
+
+        let cell = view(atColumn: 0, row: row, makeIfNecessary: false) as? LayerCell
+        let isEffect = cell?.selectEffect(at: event.locationInWindow, editing: false) == true
+        if !isEffect {
+            currentSession.effectSelection = nil
+            let thumb = thumbnail(at: point)
+            let isMaskThumb = thumb?.isMaskTarget == true
+            let isLayerThumb = thumb?.loadsSelection == true
+
+            if selectedRowIndexes.contains(row) {
+                if isMaskThumb {
+                    currentSession.selectLayerTarget(targetLayer.id, mask: true)
+                } else if isLayerThumb {
+                    currentSession.selectLayerTarget(targetLayer.id, mask: false)
+                } else {
+                    currentSession.selectLayers(currentSession.selectedLayerIDs, primary: targetLayer.id)
+                }
+            } else {
+                selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                window?.makeFirstResponder(self)
+                if isMaskThumb {
+                    currentSession.selectLayerTarget(targetLayer.id, mask: true)
+                } else {
+                    currentSession.selectLayerTarget(targetLayer.id, mask: false)
+                }
+            }
+        }
+
+        return coordinator.contextMenu(for: row)
+    }
     private static func clippingCursor(releasing: Bool) -> NSCursor {
         let image = NSImage(size: NSSize(width: 30, height: 28), flipped: false) { _ in
             let arrow = NSImage(systemSymbolName: "arrow.turn.down.right", accessibilityDescription: nil)!
@@ -282,6 +583,29 @@ final class LayerTableView: NSTableView {
     }
     private static let createClippingCursor = clippingCursor(releasing: false)
     private static let releaseClippingCursor = clippingCursor(releasing: true)
+    /// Option over a mask thumbnail: the duplicate pointer with a small eye at its lower right — an Option-click shows
+    /// the mask alone on the canvas, and an Option-drag still copies it onto another layer.
+    private static let showMaskCursor: NSCursor = {
+        let base = CanvasView.duplicateCursor
+        let eye = NSRect(x: base.hotSpot.x + 15, y: base.hotSpot.y + 18, width: 7.5, height: 5.5)
+        let size = NSSize(width: max(base.image.size.width, eye.maxX + 2), height: max(base.image.size.height, eye.maxY + 2))
+        let image = NSImage(size: size, flipped: true) { _ in
+            // The eye first, so the arrows sit in front of it.
+            let symbol = NSImage(systemSymbolName: "eye.fill", accessibilityDescription: nil)!
+            let white = symbol.withSymbolConfiguration(.init(paletteColors: [.white]))!
+            let black = symbol.withSymbolConfiguration(.init(paletteColors: [.black]))!
+            for step in 0..<16 {
+                let angle = CGFloat(step) * .pi / 8
+                white.draw(in: eye.offsetBy(dx: cos(angle), dy: sin(angle)))
+            }
+            black.draw(in: eye)
+            base.image.draw(in: NSRect(origin: .zero, size: base.image.size), from: .zero, operation: .sourceOver,
+                            fraction: 1, respectFlipped: true, hints: nil)
+            return true
+        }
+        image.accessibilityDescription = "Show mask alone"
+        return NSCursor(image: image, hotSpot: base.hotSpot)
+    }()
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let clippingTracking { removeTrackingArea(clippingTracking) }
@@ -303,7 +627,7 @@ final class LayerTableView: NSTableView {
         }
     }
     /// Keeps the cursor right over the layer list: with Option held, the clipping cursor over the bottom quarter
-    /// of a row, as in Photoshop, and the duplicate cursor over the rest of it (a mask thumbnail copies the mask); a thumbnail's own cursor with Command held over
+    /// of a row, as in Photoshop, and the duplicate cursor over the rest of it (a mask thumbnail shows the mask alone); a thumbnail's own cursor with Command held over
     /// it; otherwise the arrow — even when a
     /// tool's cursor followed the mouse in. `location` is in window coordinates; without one
     /// (a modifier change) the current mouse position is used.
@@ -322,13 +646,14 @@ final class LayerTableView: NSTableView {
     }
 
     /// With Option held, the cursor for whatever is under `point`: the clipping cursor over the bottom of a row,
-    /// the duplicate cursor over the rest of it and over a mask thumbnail an Option-drag can copy.
+    /// the duplicate cursor over the rest of it, and over a mask thumbnail the one for showing the mask alone.
     private func clippingCursor(at point: NSPoint) -> NSCursor? {
         let index = row(at: point)
         guard let session, session.layerRows.indices.contains(index) else { return nil }
         let layer = session.layerRows[index].layer
+        // Option-click on a mask shows it alone (Option-dragging it onto another layer still copies it).
         if let thumbnail = thumbnail(at: point), thumbnail.isMaskTarget, !thumbnail.isHidden {
-            return session.canEditLayers ? CanvasView.duplicateCursor : NSCursor.arrow
+            return Self.showMaskCursor
         }
         guard isClippingZone(point, row: index) else {
             return session.canEditLayers ? CanvasView.duplicateCursor : NSCursor.arrow
@@ -469,6 +794,11 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
     private let thumbnail = LayerThumbnailButton()
     private let maskThumbnail = LayerThumbnailButton()
     private let disabledMaskMark = MaskDisabledMark(labelWithString: "╱")
+    /// "16-Bit" or "HDR" after the size of a layer keeping more than 8 bits a channel (`DeepLayer`); gone once it's
+    /// rasterized to 8.
+    private let depthTag = LayerTag()
+    /// Holds the tag inside the row while it shows; hidden, it gives its room back to the size.
+    private var depthTagFits: NSLayoutConstraint!
     /// Between the thumbnails: the chain while layer and mask are linked, empty (still clickable) once unlinked.
     private let linkButton = NSButton()
     private var maskGap: NSLayoutConstraint!
@@ -542,14 +872,16 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
         disabledMaskMark.font = .systemFont(ofSize: 32, weight: .medium)
         disabledMaskMark.textColor = .systemRed
         disabledMaskMark.isHidden = true
+        depthTag.isHidden = true
         nameLabel.lineBreakMode = .byTruncatingTail
         // One line, whatever the name holds: a text layer named after a paragraph would otherwise grow the row.
         nameLabel.usesSingleLineMode = true
         nameLabel.maximumNumberOfLines = 1
         nameLabel.font = .systemFont(ofSize: 13)
+        nameLabel.wantsLayer = true
         dimensions.font = .systemFont(ofSize: 10)
         dimensions.textColor = .secondaryLabelColor
-        for view in [eye, disclosure, thumbnail, linkButton, maskThumbnail, disabledMaskMark, nameLabel, dimensions] {
+        for view in [eye, disclosure, thumbnail, linkButton, maskThumbnail, disabledMaskMark, depthTag, nameLabel, dimensions] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -592,25 +924,22 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
             maskThumbnail.centerXAnchor.constraint(equalTo: maskSlot.centerXAnchor),
             maskThumbnail.centerYAnchor.constraint(equalTo: topAnchor, constant: 26),
             maskThumbnailWidth, maskThumbnailHeight,
+            // Inside the 2 pt selection outline, touching it on the right and bottom.
             disabledMaskMark.centerXAnchor.constraint(equalTo: maskThumbnail.centerXAnchor),
             disabledMaskMark.centerYAnchor.constraint(equalTo: maskThumbnail.centerYAnchor),
             nameLabel.leadingAnchor.constraint(equalTo: maskSlot.trailingAnchor, constant: 5),
             nameLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             nameLabel.topAnchor.constraint(equalTo: topAnchor, constant: 9),
             dimensions.leadingAnchor.constraint(equalTo: nameLabel.leadingAnchor),
-            dimensions.trailingAnchor.constraint(equalTo: nameLabel.trailingAnchor),
-            dimensions.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 3)
+            dimensions.trailingAnchor.constraint(lessThanOrEqualTo: nameLabel.trailingAnchor),
+            dimensions.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 3),
+            depthTag.leadingAnchor.constraint(equalTo: dimensions.trailingAnchor, constant: 5),
+            depthTag.centerYAnchor.constraint(equalTo: dimensions.centerYAnchor)
         ])
-        let menu = NSMenu()
-        for (title, action) in [("Rename…", #selector(rename)), ("Hide/Show Layer", #selector(toggleVisibility)),
-                                ("Add White Mask", #selector(addWhiteMask)), ("Add Black Mask", #selector(addBlackMask)),
-                                ("Enable/Disable Mask", #selector(toggleMask)), ("Delete Mask", #selector(deleteMask)), ("Release Clipping Mask", #selector(removeLiveMask)),
-                                ("Move Out of Folder", #selector(moveOut)), ("Delete Layer / Folder", #selector(deleteLayer))] {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            item.target = self
-            menu.addItem(item)
-        }
-        self.menu = menu
+        depthTagFits = depthTag.trailingAnchor.constraint(lessThanOrEqualTo: nameLabel.trailingAnchor)
+        // A narrow panel truncates the size before the tag.
+        dimensions.lineBreakMode = .byTruncatingTail
+        dimensions.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -672,7 +1001,7 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
             : "Unlink layer and mask to move or transform them separately"
         linkButton.setAccessibilityLabel(layer.mask?.isLinked == false ? "Link mask: \(layer.name)" : "Unlink mask: \(layer.name)")
         thumbnail.toolTip = editableText ? "Editable text layer" : "Select image pixels"
-        maskThumbnail.toolTip = "Select layer mask; Shift-click to enable/disable; Cmd-click to select its black areas (Cmd-Shift adds, Cmd-Option subtracts)"
+        maskThumbnail.toolTip = "Select layer mask; Option-click to view it alone; Shift-click to enable/disable; Cmd-click to select its black areas (Cmd-Shift adds, Cmd-Option subtracts)"
         thumbnail.setAccessibilityLabel("Select \(editableText ? "text" : "image"): \(layer.name)")
         maskThumbnail.setAccessibilityLabel("Select mask: \(layer.name)")
         updateTarget()
@@ -680,7 +1009,12 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
         // A reused cell must not carry another row's half-finished rename.
         if renaming, layerID != layer.id { restoreLabel() }
         if !renaming { nameLabel.stringValue = (layer.maskSourceID == nil ? "" : "↳ ") + layer.name }
-        dimensions.stringValue = layer.liveText != nil ? "Text" : layer.adjustment != nil ? "Adjustment · Double-click to edit" : layer.isGroup ? "Folder" : "\(Int(layer.size.width.rounded())) × \(Int(layer.size.height.rounded())) px"
+        dimensions.stringValue = layer.liveText != nil ? "Text · Double-click to edit" : layer.adjustment != nil ? "Adjustment · Double-click to edit" : layer.isGroup ? "Folder" : layer.sizeLabel
+        depthTag.text = layer.depthLabel ?? ""
+        depthTag.toolTip = layer.asset?.isHDR == true ? "HDR layer: keeps light brighter than white, shown as white"
+                                                      : "16-bit layer: keeps 16 bits a channel"
+        depthTag.isHidden = layer.depthLabel == nil || layer.maskSourceID != nil
+        depthTagFits.isActive = !depthTag.isHidden
         if let source = layer.maskSourceID {
             let sourceName = session.document?.layers.first(where: { $0.id == source })?.name ?? "Missing source"
             dimensions.stringValue = "Clipped to \(sourceName)"
@@ -713,6 +1047,8 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
         maskThumbnail.layer?.borderColor = NSColor.controlAccentColor.cgColor
         thumbnail.layer?.borderWidth = active && !mask ? 2 : 0
         maskThumbnail.layer?.borderWidth = active && mask ? 2 : 0
+        // Shown alone on the canvas, the mask is outlined in white rather than the accent.
+        if active, session?.maskAloneLayer?.id == layerID { maskThumbnail.layer?.borderColor = NSColor.white.cgColor }
     }
     /// Types the layer's name in the row: Return keeps it, Escape leaves it as it was, as does clicking away.
     func beginRenaming() {
@@ -722,9 +1058,7 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
         renaming = true
         nameLabel.isEditable = true
         nameLabel.isSelectable = true
-        nameLabel.isBezeled = true
-        nameLabel.bezelStyle = .roundedBezel
-        nameLabel.drawsBackground = true
+        nameLabel.layer?.backgroundColor = NSColor.quaternaryLabelColor.cgColor
         nameLabel.delegate = self
         nameLabel.stringValue = layerName
         window?.makeFirstResponder(nameLabel)
@@ -734,8 +1068,7 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
         renaming = false
         nameLabel.isEditable = false
         nameLabel.isSelectable = false
-        nameLabel.isBezeled = false
-        nameLabel.drawsBackground = false
+        nameLabel.layer?.backgroundColor = nil
         nameLabel.delegate = nil
     }
     private func endRenaming(keeping: Bool) {
@@ -779,35 +1112,18 @@ private final class LayerCell: NSTableCellView, NSTextFieldDelegate {
         let flags = NSApp.currentEvent?.modifierFlags ?? []
         return flags.contains(.option) ? .subtract : flags.contains(.shift) ? .add : .replace
     }
+    @objc func toggleMaskAlone() {
+        guard let layerID else { return }
+        session?.toggleMaskAlone(layerID)
+    }
     @objc private func selectMask() {
         guard let layerID else { return }
         session?.selectLayerTarget(layerID, mask: true)
         if NSApp.currentEvent?.modifierFlags.contains(.shift) == true { session?.toggleLayerMask() }
     }
-    @objc private func addWhiteMask() { selectImage(); session?.addMask() }
-    @objc private func addBlackMask() { selectImage(); session?.addMask(revealing: false) }
-    @objc private func toggleMask() { selectImage(); session?.toggleLayerMask() }
-    @objc private func removeLiveMask() { if let layerID { session?.removeLiveMask(from: layerID) } }
-    @objc private func deleteMask() { selectImage(); session?.deleteLayerMask() }
     @objc private func toggleExpansion() { if let layerID { session?.toggleGroupExpansion(layerID) } }
-    @objc private func moveOut() {
-        guard let session, let layerID else { return }
-        session.selectLayer(layerID)
-        session.moveActiveLayerOutOfGroup()
-    }
     private var thumbnailKey: ThumbnailKey?
     @objc private func toggleVisibility() { if let layerID { session?.toggleLayerVisibility(layerID) } }
-    /// Delete on a row that's part of a multi-selection removes the whole selection, like the trash button.
-    @objc private func deleteLayer() {
-        guard let layerID, let session else { return }
-        if session.selectedLayerIDs.count > 1, session.selectedLayerIDs.contains(layerID) { session.deleteSelectedLayers() }
-        else { session.deleteLayer(layerID) }
-    }
-    @objc private func rename() {
-        guard let session, session.canEditLayers, let layerID else { return }
-        session.activeLayerID = layerID
-        session.renamingLayerID = layerID
-    }
     /// Adjustment layers' icons, a little smaller than a bare symbol shows in the thumbnail (roughly
     /// 15.5 pt instead of 18). Drawn into a 36 pt template image (the thumbnail's size), which the button
     /// shows 1:1 and still tints; 1.21× the symbol's natural size lands the glyph there.
@@ -1030,12 +1346,12 @@ private final class LayerThumbnailButton: NSButton, NSDraggingSource {
 }
 
 extension LayerThumbnailButton {
-    /// Option-drag from a mask thumbnail carries a copy of the mask to another row; a click without a drag just
-    /// selects the mask.
+    /// Option-drag from a mask thumbnail carries a copy of the mask to another row; a click without a drag shows
+    /// the mask alone on the canvas, or the composite again, as in Photoshop.
     fileprivate func dragMaskCopy(_ down: NSEvent) {
         guard let window, let layerID else { return }
         while let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
-            if event.type == .leftMouseUp { sendAction(action, to: target); return }
+            if event.type == .leftMouseUp { _ = target?.perform(#selector(LayerCell.toggleMaskAlone)); return }
             let dx = event.locationInWindow.x - down.locationInWindow.x, dy = event.locationInWindow.y - down.locationInWindow.y
             guard dx * dx + dy * dy >= 9 else { continue }
             let item = NSPasteboardItem()
@@ -1088,7 +1404,24 @@ private final class EyeSwipeButton: NSButton {
         }
     }
 }
-private final class MaskDisabledMark: NSTextField {
+/// A small rounded tag after a layer's size, naming something about its pixels ("16-Bit", "HDR"). Clicks go to the row.
+private final class LayerTag: NSView {
+    var text = "" { didSet { if text != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true } } }
+    private var attributed: NSAttributedString {
+        NSAttributedString(string: text, attributes: [.font: NSFont.systemFont(ofSize: 9, weight: .medium),
+                                                      .foregroundColor: NSColor.secondaryLabelColor])
+    }
+    override var intrinsicContentSize: NSSize { NSSize(width: ceil(attributed.size().width) + 10, height: 14) }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
+        let text = attributed, size = text.size()
+        text.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2))
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+final class MaskDisabledMark: NSTextField {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
@@ -1098,4 +1431,24 @@ private struct ThumbnailKey: Equatable {
     let transform: LayerTransform
     let canvas: CGSize
     var editableText = false
+}
+
+extension ImageLayer {
+    /// The layer's size on the canvas and, once it's scaled, by how much, for its row. A photo shrunk to 5% keeps
+    /// every one of its pixels; the percentage says so, where the size alone reads as if it had been resampled small.
+    var sizeLabel: String {
+        let text = "\(Int(size.width.rounded())) × \(Int(size.height.rounded())) px"
+        guard let pixels = asset?.image.width, pixels > 0 else { return text }
+        // Measured across the width, as the Transform bar's Scale field is.
+        let percent = Double(size.width) / Double(pixels) * 100
+        guard abs(percent - 100) >= 0.05 else { return text }
+        return text + " · " + percent.formatted(.number.precision(.fractionLength(0...1))) + "%"
+    }
+
+    /// The tag after the size of a layer keeping 16 bits a channel, or light brighter than white (`DeepLayer`); nil
+    /// once it's rasterized to 8.
+    var depthLabel: String? {
+        guard let asset, asset.deep != nil, liveText == nil, adjustment == nil, !isGroup else { return nil }
+        return asset.isHDR ? "HDR" : "16-Bit"
+    }
 }

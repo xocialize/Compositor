@@ -105,6 +105,23 @@ nonisolated struct OuterGlowEffect: Codable, Equatable, Sendable {
     }
 }
 
+/// A glow cast inside the layer's own edges, emanating inward from its boundary.
+nonisolated struct InnerGlowEffect: Codable, Equatable, Sendable {
+    var enabled: Bool? = nil
+    var isEnabled: Bool { enabled ?? true }
+    var size: CGFloat = 10
+    var red: CGFloat = 1
+    var green: CGFloat = 1
+    var blue: CGFloat = 1
+    var opacity: Double = 0.75
+    var color: PaletteColor { PaletteColor(red: red, green: green, blue: blue) }
+    var isValid: Bool {
+        size.isFinite && (0...500).contains(size)
+            && opacity.isFinite && (0...1).contains(opacity)
+            && [red, green, blue].allSatisfy { $0.isFinite && (0...1).contains($0) }
+    }
+}
+
 /// What a layer draws around itself. Kept with the layer, so it follows every edit and can be changed or removed
 /// at any time; the pixels themselves are never touched.
 nonisolated struct LayerEffects: Codable, Equatable, Sendable {
@@ -113,11 +130,26 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
     var colorOverlay: ColorOverlayEffect? = nil
     var innerShadow: InnerShadowEffect? = nil
     var outerGlow: OuterGlowEffect? = nil
-    var isEmpty: Bool { stroke == nil && shadow == nil && colorOverlay == nil && innerShadow == nil && outerGlow == nil }
+    var innerGlow: InnerGlowEffect? = nil
+    var isEmpty: Bool { stroke == nil && shadow == nil && colorOverlay == nil && innerShadow == nil && outerGlow == nil && innerGlow == nil }
     var isValid: Bool {
         (stroke?.isValid ?? true) && (shadow?.isValid ?? true)
             && (colorOverlay?.isValid ?? true) && (innerShadow?.isValid ?? true)
-            && (outerGlow?.isValid ?? true)
+            && (outerGlow?.isValid ?? true) && (innerGlow?.isValid ?? true)
+    }
+    /// The effects for an image resampled by `factor`: every size, distance and blur in pixels scaled with it, held to
+    /// the ranges `isValid` accepts.
+    func scaled(by factor: CGFloat) -> LayerEffects {
+        func scale(_ value: CGFloat?, upTo limit: CGFloat) -> CGFloat { min(limit, (value ?? 0) * factor) }
+        var result = self
+        result.stroke?.size = scale(stroke?.size, upTo: 500)
+        result.shadow?.distance = scale(shadow?.distance, upTo: 5000)
+        result.shadow?.blur = scale(shadow?.blur, upTo: 500)
+        result.innerShadow?.distance = scale(innerShadow?.distance, upTo: 5000)
+        result.innerShadow?.blur = scale(innerShadow?.blur, upTo: 500)
+        result.outerGlow?.size = scale(outerGlow?.size, upTo: 500)
+        result.innerGlow?.size = scale(innerGlow?.size, upTo: 500)
+        return result
     }
     var kinds: [LayerEffectKind] { LayerEffectKind.allCases.filter { contains($0) } }
     func contains(_ kind: LayerEffectKind) -> Bool {
@@ -127,6 +159,7 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
         case .colorOverlay: return colorOverlay != nil
         case .innerShadow: return innerShadow != nil
         case .outerGlow: return outerGlow != nil
+        case .innerGlow: return innerGlow != nil
         }
     }
     func isEnabled(_ kind: LayerEffectKind) -> Bool {
@@ -136,6 +169,7 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
         case .colorOverlay: return colorOverlay?.isEnabled == true
         case .innerShadow: return innerShadow?.isEnabled == true
         case .outerGlow: return outerGlow?.isEnabled == true
+        case .innerGlow: return innerGlow?.isEnabled == true
         }
     }
     /// The effect's own color, and a way to put a new one back.
@@ -146,6 +180,7 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
         case .colorOverlay: return colorOverlay?.color
         case .innerShadow: return innerShadow?.color
         case .outerGlow: return outerGlow?.color
+        case .innerGlow: return innerGlow?.color
         }
     }
     mutating func setColor(_ color: PaletteColor, for kind: LayerEffectKind) {
@@ -155,6 +190,7 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
         case .colorOverlay: colorOverlay?.red = color.red; colorOverlay?.green = color.green; colorOverlay?.blue = color.blue
         case .innerShadow: innerShadow?.red = color.red; innerShadow?.green = color.green; innerShadow?.blue = color.blue
         case .outerGlow: outerGlow?.red = color.red; outerGlow?.green = color.green; outerGlow?.blue = color.blue
+        case .innerGlow: innerGlow?.red = color.red; innerGlow?.green = color.green; innerGlow?.blue = color.blue
         }
     }
     mutating func remove(_ kind: LayerEffectKind) {
@@ -164,6 +200,7 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
         case .colorOverlay: colorOverlay = nil
         case .innerShadow: innerShadow = nil
         case .outerGlow: outerGlow = nil
+        case .innerGlow: innerGlow = nil
         }
     }
     mutating func setEnabled(_ enabled: Bool, for kind: LayerEffectKind) {
@@ -173,6 +210,7 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
         case .colorOverlay: colorOverlay?.enabled = enabled
         case .innerShadow: innerShadow?.enabled = enabled
         case .outerGlow: outerGlow?.enabled = enabled
+        case .innerGlow: innerGlow?.enabled = enabled
         }
     }
     var visible: LayerEffects {
@@ -180,12 +218,13 @@ nonisolated struct LayerEffects: Codable, Equatable, Sendable {
                      shadow: shadow?.isEnabled == true ? shadow : nil,
                      colorOverlay: colorOverlay?.isEnabled == true ? colorOverlay : nil,
                      innerShadow: innerShadow?.isEnabled == true ? innerShadow : nil,
-                     outerGlow: outerGlow?.isEnabled == true ? outerGlow : nil)
+                     outerGlow: outerGlow?.isEnabled == true ? outerGlow : nil,
+                     innerGlow: innerGlow?.isEnabled == true ? innerGlow : nil)
     }
 }
 
 nonisolated enum LayerEffectKind: String, CaseIterable, Sendable {
-    case stroke = "Stroke", shadow = "Drop Shadow", colorOverlay = "Color Overlay", innerShadow = "Inner Shadow", outerGlow = "Outer Glow"
+    case stroke = "Stroke", shadow = "Drop Shadow", colorOverlay = "Color Overlay", innerShadow = "Inner Shadow", outerGlow = "Outer Glow", innerGlow = "Inner Glow"
 }
 
 struct LayerEffectSelection: Equatable {
@@ -227,6 +266,8 @@ extension EditorSession {
             effects.innerShadow = InnerShadowEffect()
         case .outerGlow where effects.outerGlow == nil:
             effects.outerGlow = OuterGlowEffect()
+        case .innerGlow where effects.innerGlow == nil:
+            effects.innerGlow = InnerGlowEffect()
         default: break
         }
         setEffects(effects, on: id, name: "Add " + kind.rawValue)
@@ -262,6 +303,7 @@ extension EditorSession {
             case .colorOverlay: effects.colorOverlay = original.colorOverlay
             case .innerShadow: effects.innerShadow = original.innerShadow
             case .outerGlow: effects.outerGlow = original.outerGlow
+            case .innerGlow: effects.innerGlow = original.innerGlow
             }
             setEffects(effects, on: editing.layerID, name: "Cancel " + editing.kind.rawValue)
         }
@@ -313,6 +355,7 @@ extension EditorSession {
         case .colorOverlay: effects.colorOverlay = original.colorOverlay
         case .innerShadow: effects.innerShadow = original.innerShadow
         case .outerGlow: effects.outerGlow = original.outerGlow
+        case .innerGlow: effects.innerGlow = original.innerGlow
         }
         setEffects(effects, on: target, name: "Copy " + kind.rawValue)
         selectEffect(kind, on: target)
@@ -409,7 +452,7 @@ nonisolated enum LayerEffectsRenderer {
         guard effects.isValid else { throw ProjectError.invalid }
         let inset = margin(for: effects)
         let width = image.width + Int(inset) * 2, height = image.height + Int(inset) * 2
-        guard width > 0, height > 0, width * height <= 100_000_000 else { throw ProjectError.tooLarge }
+        guard width > 0, height > 0, width * height <= DocumentLimits.maxSurfacePixels else { throw ProjectError.tooLarge }
         let placed = CGRect(x: inset, y: inset, width: CGFloat(image.width), height: CGFloat(image.height))
         let full = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
         // The layer as it is shown: its pixels through its mask.
@@ -442,24 +485,41 @@ nonisolated enum LayerEffectsRenderer {
         if let stroke, !stroke.inside { try drawStroke(stroke) }
         // Source-over preserves effects beneath transparent pixels. BrushRaster.draw uses .copy,
         // which would erase the stroke/shadow everywhere inside the source's rectangular bounds.
-        context.saveGState()
-        context.translateBy(x: placed.minX, y: placed.maxY)
-        context.scaleBy(x: 1, y: -1)
-        context.setBlendMode(.normal)
-        context.draw(shown, in: CGRect(origin: .zero, size: placed.size))
-        context.restoreGState()
-        // Over the pixels: a flat color, then a shadow inside the layer's own edges.
-        if let overlay = effects.colorOverlay, overlay.isEnabled, overlay.opacity > 0,
-           let shape = try? coverage(shown, in: placed, size: CGSize(width: width, height: height), blur: 0) {
-            fill(overlay.color, alpha: overlay.opacity, coverage: shape, in: full, context: context)
+        // The layer's own pixels, recolored by a color overlay, then an inner glow and an inner shadow, each keeping
+        // the pixels' alpha as Photoshop's do, so a translucent pixel takes them fully and the effects beneath stay
+        // untinted.
+        let layer = try BrushRaster.context(width: width, height: height, mask: false)
+        BrushRaster.draw(shown, in: placed, mask: false, context: layer)
+        if let overlay = effects.colorOverlay, overlay.isEnabled, overlay.opacity > 0 {
+            recolor(layer, overlay.color, alpha: overlay.opacity, amount: nil, in: full)
+        }
+        if let innerGlow = effects.innerGlow, innerGlow.isEnabled, innerGlow.opacity > 0,
+           let insideGlow = try? innerGlowCoverage(shown, placed: placed, size: CGSize(width: width, height: height), glow: innerGlow) {
+            recolor(layer, innerGlow.color, alpha: innerGlow.opacity, amount: insideGlow, in: full)
         }
         if let inner = effects.innerShadow, inner.isEnabled, inner.opacity > 0,
            let inside = try? innerCoverage(shown, placed: placed, size: CGSize(width: width, height: height), shadow: inner) {
-            fill(inner.color, alpha: inner.opacity, coverage: inside, in: full, context: context)
+            recolor(layer, inner.color, alpha: inner.opacity, amount: inside, in: full)
         }
+        guard let styled = layer.makeImage() else { throw ExportError.render }
+        context.saveGState()
+        context.translateBy(x: 0, y: full.height)
+        context.scaleBy(x: 1, y: -1)
+        context.setBlendMode(.normal)
+        context.draw(styled, in: full)
+        context.restoreGState()
         if let stroke, stroke.inside { try drawStroke(stroke) }
         guard let result = context.makeImage() else { throw ExportError.render }
         return (result, inset)
+    }
+
+    /// How strongly an inner glow falls on each pixel: strongest at the layer's edges, fading inward. It's the
+    /// strength before the layer's own alpha, which the glow keeps as it recolors the pixels (see `recolor`).
+    static func innerGlowCoverage(_ image: CGImage, placed: CGRect, size: CGSize, glow: InnerGlowEffect) throws -> CGImage {
+        let width = Int(size.width), height = Int(size.height)
+        let blurred = try coverage(image, in: placed, size: size, blur: glow.size)
+        let inside = try GuidedMatte.levels(of: blurred, width: width, height: height).map { max(0, min(1, 1 - $0)) }
+        return try GuidedMatte.image(inside, width: width, height: height)
     }
 
     /// The layer's pixels with its mask applied, or the pixels as they are when it has none.
@@ -476,21 +536,32 @@ nonisolated enum LayerEffectsRenderer {
         return result
     }
 
+    /// Moves the pixels' color toward `color` by `alpha`, scaled by `amount` where given, keeping their alpha:
+    /// source-atop, so a half-transparent pixel takes the color fully.
+    static func recolor(_ context: CGContext, _ color: PaletteColor, alpha: Double, amount: CGImage?, in rect: CGRect) {
+        context.saveGState()
+        context.setBlendMode(.sourceAtop)
+        if let amount { fill(color, alpha: alpha, coverage: amount, in: rect, context: context) }
+        else {
+            context.setFillColor(CGColor(srgbRed: color.red, green: color.green, blue: color.blue, alpha: CGFloat(alpha)))
+            context.fill(rect)
+        }
+        context.restoreGState()
+    }
+
     /// A shadow's coverage for one piece of a layer: its shape, moved and softened.
     static func shadowCoverage(_ pixels: CGImage, in size: CGSize, offset: CGSize, blur: CGFloat) throws -> CGImage {
         let placed = CGRect(origin: .zero, size: CGSize(width: pixels.width, height: pixels.height))
         return try coverage(pixels, in: placed.offsetBy(dx: offset.width, dy: offset.height), size: size, blur: blur)
     }
 
-    /// An inner shadow's coverage: what lies outside the layer, moved and softened, kept to the layer's own shape.
+    /// How strongly an inner shadow falls on each pixel: what lies outside the layer, moved and softened. Like
+    /// `innerGlowCoverage`, it's the strength before the layer's own alpha.
     static func innerCoverage(_ image: CGImage, placed: CGRect, size: CGSize, shadow: InnerShadowEffect) throws -> CGImage {
         let width = Int(size.width), height = Int(size.height)
-        let shape = try coverage(image, in: placed, size: size, blur: 0)
         let moved = try coverage(image, in: placed.offsetBy(dx: shadow.offset.width, dy: shadow.offset.height),
                                  size: size, blur: shadow.blur)
-        var inside = try GuidedMatte.levels(of: shape, width: width, height: height)
-        let outside = try GuidedMatte.levels(of: moved, width: width, height: height)
-        for i in inside.indices { inside[i] = max(0, min(1, inside[i] * (1 - outside[i]))) }
+        let inside = try GuidedMatte.levels(of: moved, width: width, height: height).map { max(0, min(1, 1 - $0)) }
         return try GuidedMatte.image(inside, width: width, height: height)
     }
 
@@ -585,7 +656,7 @@ nonisolated enum LayerEffectsRenderer {
         return result
     }
 
-    private static func fill(_ color: PaletteColor, alpha: Double, coverage: CGImage, in rect: CGRect, context: CGContext) {
+    static func fill(_ color: PaletteColor, alpha: Double, coverage: CGImage, in rect: CGRect, context: CGContext) {
         // Coverage is a CGImage: use the same local image flip as the source, so asymmetric marks
         // and their effects line up instead of mirroring the coverage vertically.
         BrushRaster.fill(CGColor(srgbRed: color.red, green: color.green, blue: color.blue, alpha: 1),

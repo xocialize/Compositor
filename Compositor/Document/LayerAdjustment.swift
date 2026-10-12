@@ -3,8 +3,8 @@ import CoreImage
 
 nonisolated enum AdjustmentKind: String, Codable, CaseIterable, Sendable {
     case hsv = "Hue/Saturation", levels = "Levels", curves = "Curves"
-    case exposure = "Exposure", gradientMap = "Gradient Map", grain = "Grain"
-    case gaussianBlur = "Gaussian Blur", motionBlur = "Motion Blur", addNoise = "Add Noise"
+    case exposure = "Exposure", gradientMap = "Gradient Map", grain = "Grain", addNoise = "Add Noise"
+    case gaussianBlur = "Gaussian Blur", motionBlur = "Motion Blur"
     case invert = "Invert"
     case blackWhite = "Black & White", colorBalance = "Color Balance"
     var symbol: String {
@@ -141,7 +141,27 @@ nonisolated struct LayerAdjustment: Codable, Equatable, Sendable {
     }
     /// `region` is the part of the document `image` covers (the whole image at one unit per pixel when
     /// omitted), so Grain's pattern stays fixed in the document however the canvas splits its drawing.
-    func apply(_ image: CGImage, region: CGRect? = nil, scale: CGFloat = 1) throws -> CGImage {
+    /// Its color lookup, for those whose channels mix, to apply at 16 bits (`DeepLayer.lookup`); nil for the rest.
+    var sixteenBitLookup: (cube: Data, dimension: Int)? {
+        switch kind {
+        case .hsv: (HueSaturationFilter.cube(resolvedHSV), HueSaturationFilter.dimension)
+        case .blackWhite, .colorBalance, .gradientMap: GPUAdjustment.cube(for: self).map { ($0, GPUAdjustment.dimension) }
+        default: nil
+        }
+    }
+
+    /// `apply` on 16-bit or HDR pixels (`DeepLayer`): the blurs once in Core Image, which keeps them as they are;
+    /// Exposure exactly on HDR ones; through its color lookup when its channels mix; otherwise run several times and
+    /// read between (`DeepLayer.run`).
+    func applySixteenBit(_ image: CGImage, region: CGRect? = nil, scale: CGFloat = 1) throws -> CGImage {
+        if kind == .gaussianBlur || kind == .motionBlur { return try apply(image, region: region, scale: scale, sixteenBit: true) }
+        if kind == .exposure, DeepLayer.isHDR(image) { return try DeepLayer.exposure(image, exposure) }
+        if let lookup = sixteenBitLookup { return try DeepLayer.lookup(image, cube: lookup.cube, dimension: lookup.dimension) }
+        return try DeepLayer.run(image) { try apply($0, region: region, scale: scale) }
+    }
+
+    /// `sixteenBit`: the blurs render at the image's own depth (`FilterJob.sixteenBit`).
+    func apply(_ image: CGImage, region: CGRect? = nil, scale: CGFloat = 1, sixteenBit: Bool = false) throws -> CGImage {
         switch kind {
         case .hsv:
             return try HueSaturationFilter.run(HueSaturationJob(image: image,
@@ -169,10 +189,14 @@ nonisolated struct LayerAdjustment: Codable, Equatable, Sendable {
             case .motionBlur: .motionBlur
             default: .addNoise
             }
-            return try PixelFilter.run(FilterJob(kind: filterKind, image: image, settings: settings,
-                                                  scale: scale, selection: nil, mapping: .identity,
-                                                  seed: resolvedNoiseSeed,
-                                                  noiseOrigin: region?.origin ?? .zero))
+            var job = FilterJob(kind: filterKind, image: image, settings: settings,
+                                scale: scale, selection: nil, mapping: .identity,
+                                seed: resolvedNoiseSeed,
+                                // The region's origin in the image's own pixels.
+                                noiseOrigin: region.map { CGPoint(x: $0.minX * CGFloat(image.width) / max(1, $0.width),
+                                                                  y: $0.minY * CGFloat(image.height) / max(1, $0.height)) } ?? .zero)
+            job.sixteenBit = sixteenBit && filterKind != .addNoise
+            return try PixelFilter.run(job)
         case .invert:
             return try PixelInvert.run(PixelInvert.Job(image: image, isMask: false,
                                                        pixelToDocument: .identity, selection: nil))

@@ -7,9 +7,9 @@ nonisolated enum PSDError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .truncated: "The Photoshop file could not be read. It may be damaged or incomplete."
-        case .unsupportedVersion: "Large Document (.psb) Photoshop files aren’t supported."
-        case .unsupportedColorMode: "Only 8-bit RGB Photoshop files can be imported."
-        case .unsupportedDepth: "Only 8-bit RGB Photoshop files can be imported."
+        case .unsupportedVersion: "This Photoshop file uses a format version Compositor can’t read."
+        case .unsupportedColorMode: "Only 8-bit RGB and CMYK Photoshop files can be imported."
+        case .unsupportedDepth: "Only 8-bit RGB and CMYK Photoshop files can be imported."
         case .unsupportedCompression: "This Photoshop file uses a layer compression method that isn’t supported."
         }
     }
@@ -30,6 +30,8 @@ nonisolated struct PSDDocument: @unchecked Sendable {
     var width: Int
     var height: Int
     var resolution: Double
+    /// A CMYK file's profile, which its layers were converted to RGB through; nil for an RGB file.
+    var cmykProfile: CMYKProfile?
     /// Bottom to top, including folders. Hidden section dividers are not stored.
     var layers: [PSDRecord]
 }
@@ -43,15 +45,22 @@ nonisolated struct PSDRecord: @unchecked Sendable {
     var opacity: Double = 1
     var blendKey = "norm"
     var clipping = false
+    var croppedToCanvas = false
     var bounds = CGRect.zero
     var image: CGImage?
     var mask: CGImage?
+    /// Where `mask` sits on the document, and the value everywhere outside it: Photoshop stores only the part of a
+    /// mask that isn't that default.
+    var maskBounds = CGRect.zero
+    var maskDefault: UInt8 = 255
     var maskEnabled = true
     var maskLinked = true
     var adjustment: LayerAdjustment?
     var kind = PSDLayerKind.raster
     var shape: LayerShapeStyle?
     var shapeNotes: [String] = []
+    /// Parsed Photoshop type, when the `TySh` block maps onto an editable text layer.
+    var text: PSDText.Source?
 }
 
 nonisolated enum PSDLayerKind: Equatable, Sendable {
