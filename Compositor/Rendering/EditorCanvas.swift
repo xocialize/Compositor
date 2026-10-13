@@ -103,6 +103,8 @@ final class CanvasView: NSView {
     private var samplingColor = false
     private enum GradientHandle { case start, end }
     private var gradientDrag: GradientHandle?
+    /// The end of Progressive Blur's line being dragged, while its panel is open.
+    private var progressiveDrag: GradientHandle?
     private var antsTimer: Timer?
     private var modifierMonitor: Any?
     private var sampleClickMonitor: Any?
@@ -1769,6 +1771,10 @@ final class CanvasView: NSView {
             session.beginCameraRawDrag(at: session.viewport.documentPoint(from: point, documentSize: document.size))
             return
         }
+        if session.filterEdit?.kind == .progressiveBlur, !spaceHeld {
+            beginProgressiveDrag(at: point)
+            return
+        }
         if session.levels?.sampleMode != nil, !spaceHeld, let document = session.document {
             session.sampleLevels(at: session.viewport.documentPoint(from: point, documentSize: document.size))
             FloatingPanelController.refocus(NSUserInterfaceItemIdentifier("levelsPanel"))
@@ -1860,6 +1866,15 @@ final class CanvasView: NSView {
         }
         if session.filterEdit?.cameraRawDrag != nil, let document = session.document {
             session.dragCameraRaw(to: session.viewport.documentPoint(from: point, documentSize: document.size))
+            return
+        }
+        if let handle = progressiveDrag, let settings = session.filterEdit?.settings, let document = session.document {
+            var pixel = session.viewport.documentPoint(from: point, documentSize: document.size)
+            if event.modifierFlags.contains(.shift), let anchor = handle == .start ? settings.progressiveEnd : settings.progressiveStart {
+                pixel = Self.snapped(pixel, around: anchor)
+            }
+            session.moveProgressiveBlur(start: handle == .start ? pixel : nil, end: handle == .end ? pixel : nil)
+            synchronizeDisplay()
             return
         }
         if textBoxAnchor != nil { dragTextGesture(to: point); return }
@@ -2048,6 +2063,12 @@ final class CanvasView: NSView {
         window?.invalidateCursorRects(for: self)
     }
     override func mouseUp(with event: NSEvent) {
+        if progressiveDrag != nil {
+            progressiveDrag = nil
+            // The panel keeps the keyboard, for Return and Escape.
+            FloatingPanelController.refocus(NSUserInterfaceItemIdentifier("filterPanel"))
+            return
+        }
         if session.filterEdit?.cameraRawGuideDraft != nil {
             session.commitCameraRawGeometryGuide()
         }
@@ -2439,6 +2460,19 @@ final class CanvasView: NSView {
         }
     }
 
+    /// Progressive Blur: grabs an end of its line, or starts a new one at the pointer, sharp there.
+    private func beginProgressiveDrag(at point: CGPoint) {
+        guard let document = session.document else { return }
+        if let line = transformOverlay.progressiveLine {
+            if hypot(point.x - line.end.x, point.y - line.end.y) <= 10 { progressiveDrag = .end; return }
+            if hypot(point.x - line.start.x, point.y - line.start.y) <= 10 { progressiveDrag = .start; return }
+        }
+        let pixel = session.viewport.documentPoint(from: point, documentSize: document.size)
+        session.moveProgressiveBlur(start: pixel, end: pixel)
+        progressiveDrag = .end
+        synchronizeDisplay()
+    }
+
     /// Grabs an existing endpoint, or starts a new line at the pointer.
     private func beginGradientDrag(at point: CGPoint) {
         guard let document = session.document else { return }
@@ -2617,7 +2651,8 @@ extension CanvasView {
             return hideGPUView(dirtyRect)
         }
         if view.isHidden { view.isHidden = false }
-        renderer.present(frame, in: view.metalLayer)
+        // A 16-bit or HDR layer has tones between the screen's 8-bit levels: dithered on the way, not rounded into bands.
+        renderer.present(frame, in: view.metalLayer, dither: document.layers.contains { $0.asset?.deep != nil })
         return true
     }
 
@@ -3035,10 +3070,10 @@ extension CanvasView {
                 placed = placement.place(shaped, transform: transform)
             } else if let asset = layer.asset, session.hueSaturation?.previewImage(for: layer.id) == nil,
                       session.levels?.previewImage(for: layer.id) == nil, session.filterEdit?.previewImage(for: layer.id) == nil,
-                      let hdr = DeepLayer.canvasImage(asset) {
-                // An HDR layer from its own pixels, so an adjustment over it can bring its highlights into view; the screen
-                // still shows anything brighter than white as white.
-                placed = placement.place(hdr, transform: transform)
+                      let full = DeepLayer.canvasImage(asset) {
+                // A 16-bit or HDR layer from its own pixels, so an adjustment over it previews as it will export: smooth,
+                // and bringing HDR highlights into view. The screen still shows anything brighter than white as white.
+                placed = placement.place(full, transform: transform)
             } else if let raster = layer.asset?.raster, session.hueSaturation?.previewImage(for: layer.id) == nil,
                       session.levels?.previewImage(for: layer.id) == nil, session.filterEdit?.previewImage(for: layer.id) == nil {
                 placed = placement.place(raster, transform: transform)

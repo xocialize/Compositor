@@ -110,7 +110,7 @@ import QuartzCore
             } else if let larger = texture(image, level: level - 1, mask: mask, transient: false, drawing: false) {
                 made = reduce(larger, from: Self.size(image.width, image.height, level: level - 1),
                               to: Self.size(image.width, image.height, level: level), mask: mask,
-                              hdr: !mask && DeepLayer.isHDR(image))
+                              format: Self.format(of: image, mask: mask))
             } else { made = nil }
             guard let made else { return nil }
             textures[key] = Entry(source: image, image: made, used: frame, keep: keep)
@@ -243,10 +243,15 @@ import QuartzCore
         strokes = strokes.filter { $0.value.used >= frame - keepFrames }
     }
 
-    /// `hdr`: half floats, for an HDR layer's pixels.
-    private func texture(width: Int, height: Int, mask: Bool, hdr: Bool = false) -> MTLTexture? {
+    /// The texture an image goes up as: a mask's gray; a 16-bit layer's pixels at 16 bits; an HDR layer's as half floats,
+    /// light brighter than white kept; anything else at 8 bits.
+    static func format(of image: CGImage, mask: Bool) -> MTLPixelFormat {
+        mask ? .r8Unorm : DeepLayer.isHDR(image) ? .rgba16Float : image.bitsPerComponent == 16 ? .rgba16Unorm : .rgba8Unorm
+    }
+
+    private func texture(width: Int, height: Int, mask: Bool, format: MTLPixelFormat? = nil) -> MTLTexture? {
         guard width > 0, height > 0, width <= 16_384, height <= 16_384 else { return nil }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: mask ? .r8Unorm : hdr ? .rgba16Float : .rgba8Unorm,
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format ?? (mask ? .r8Unorm : .rgba8Unorm),
                                                                   width: width, height: height, mipmapped: false)
         descriptor.usage = [.shaderRead, .shaderWrite]
         descriptor.storageMode = .shared
@@ -259,10 +264,12 @@ import QuartzCore
 
     /// The image's own bytes, copied straight in: sRGB, premultiplied, top row first — or for a mask, its gray values.
     private func upload(_ image: CGImage, mask: Bool) -> CIImage? {
-        // An HDR layer's pixels go up as half floats, light brighter than white kept.
-        let hdr = !mask && DeepLayer.isHDR(image)
-        guard let texture = texture(width: image.width, height: image.height, mask: mask, hdr: hdr),
-              let pixels = try? (mask ? Self.grayCopy(image) : hdr ? DeepLayer.hdr(image) : BrushRaster.copy(image)),
+        // A 16-bit layer's pixels go up at 16 bits, an HDR layer's as half floats (light brighter than white kept), each
+        // in the layout its texture reads.
+        let format = Self.format(of: image, mask: mask)
+        guard let texture = texture(width: image.width, height: image.height, mask: mask, format: format),
+              let pixels = try? (mask ? Self.grayCopy(image) : format == .rgba16Float ? DeepLayer.hdr(image)
+                                 : format == .rgba16Unorm ? DeepLayer.canonical(image) : BrushRaster.copy(image)),
               let data = pixels.data else { return nil }
         texture.replace(region: MTLRegionMake2D(0, 0, image.width, image.height), mipmapLevel: 0,
                         withBytes: data, bytesPerRow: pixels.bytesPerRow)
@@ -304,26 +311,48 @@ import QuartzCore
     }
 
     /// `larger` (`from` in size) sharply reduced to `to`, kept as a texture of its own.
-    private func reduce(_ larger: CIImage, from: CGSize, to: CGSize, mask: Bool, hdr: Bool = false) -> CIImage? {
+    private func reduce(_ larger: CIImage, from: CGSize, to: CGSize, mask: Bool, format: MTLPixelFormat? = nil) -> CIImage? {
         let w = Int(to.width), h = Int(to.height)
         let sx = to.width / from.width, sy = to.height / from.height
         let reduced = larger.clampedToExtent()
             .applyingFilter("CILanczosScaleTransform", parameters: [kCIInputScaleKey: sy, kCIInputAspectRatioKey: sx / sy])
             .cropped(to: CGRect(x: 0, y: 0, width: w, height: h))
-        guard let texture = texture(width: w, height: h, mask: mask, hdr: hdr), let buffer = queue.makeCommandBuffer() else { return nil }
+        guard let texture = texture(width: w, height: h, mask: mask, format: format), let buffer = queue.makeCommandBuffer() else { return nil }
         // A mask's values carry no color space; rendered in the working space, they're written as they are.
         context.render(reduced, to: texture, commandBuffer: buffer, bounds: CGRect(x: 0, y: 0, width: w, height: h),
-                       colorSpace: hdr ? DeepLayer.hdrSpace : space)
+                       colorSpace: format == .rgba16Float ? DeepLayer.hdrSpace : space)
         buffer.commit()
         buffer.waitUntilCompleted()
         return wrap(texture, mask: mask)
     }
 
+    /// `image` with up to just under half an 8-bit level of noise added to each color channel, fixed in place (so it
+    /// doesn't crawl from frame to frame), and alpha untouched.
+    static func dithered(_ image: CIImage) -> CIImage {
+        let step = 0.999 / 255
+        // Up to a level of noise, opaque (Core Image keeps colors premultiplied, so clear noise would add nothing), added
+        // to the colors by Linear Dodge, which leaves the frame's coverage as it is; then the whole shifted down by half a
+        // level, as the noise can't go below zero.
+        // The generator's alpha is random too: set to 1 first, or scaling its colors would divide by it.
+        let noise = CIFilter(name: "CIRandomGenerator")!.outputImage!.cropped(to: image.extent).settingAlphaOne(in: image.extent)
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: step, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: step, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: step, w: 0),
+            ])
+        return noise.applyingFilter("CILinearDodgeBlendMode", parameters: [kCIInputBackgroundImageKey: image])
+            .applyingFilter("CIColorMatrix", parameters: ["inputBiasVector": CIVector(x: -step / 2, y: -step / 2, z: -step / 2, w: 0)])
+            .cropped(to: image.extent)
+    }
+
     /// Draws `image` into `layer`'s next drawable, in step with the Core Animation transaction it's drawn in, so it
     /// lands on the same frame as the overlays above it.
-    func present(_ image: CIImage, in layer: CAMetalLayer) {
+    /// `dither`: the frame has tones between the drawable's 8-bit levels (a 16-bit or HDR layer's), rounded with a fine
+    /// noise rather than straight, so a gentle gradient doesn't band on screen. The noise is under half a level, so
+    /// tones already on a level (everything 8-bit) round to themselves exactly as before.
+    func present(_ image: CIImage, in layer: CAMetalLayer, dither: Bool = false) {
         guard let drawable = layer.nextDrawable(), let buffer = queue.makeCommandBuffer() else { return }
         let size = layer.drawableSize
+        let image = dither ? Self.dithered(image) : image
         // Core Image writes a texture that can be rendered to bottom row first (a plain one, top row first), so the
         // frame is turned over to land top row first.
         let upright = drawable.texture.usage.contains(.renderTarget)

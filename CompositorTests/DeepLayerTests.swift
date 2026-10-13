@@ -401,8 +401,8 @@ struct DeepLayerTests {
             together = max(together, try bends(plain, channel: channel))
             wobble = max(wobble, try bends(preview, channel: channel))
         }
-        // No more than the preview's own (its average is random: some leeway), and well under the bands it had.
-        #expect(smooth < wobble * 1.5 && smooth < together / 3,
+        // Near the preview's own (whose average is random, so a fixed bound), and well under the bands it had.
+        #expect(smooth < 0.45 && smooth < together / 3,
                 "bends of \(smooth) steps, \(together) with the channels stepped together, \(wobble) in the preview")
         #expect(try row(mixed) != row(ramp), "saturated")
     }
@@ -710,6 +710,46 @@ struct DeepLayerTests {
         #expect(try row(try #require(asset.deep)).last == 65535, "highlights clipped to white")
         session.undo()
         #expect(session.activeLayer?.asset?.isHDR == true)
+    }
+
+    /// The canvas draws a 16-bit layer from its 16-bit pixels too (a 16-bit texture), so an adjustment layer over it
+    /// previews smooth, as it will export, rather than working on the dithered 8-bit copy.
+    @Test @MainActor func sixteenBitLayersReachTheCanvasAtSixteenBits() async throws {
+        guard let renderer = GPUCanvasRenderer.shared else { return }
+        let (session, url) = try await importedSession()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let asset = try #require(session.activeLayer?.asset)
+        let shown = try #require(DeepLayer.canvasImage(asset))
+        let texture = try #require(renderer.image(shown))
+        let expected = try row(shown)
+        var out = [Float](repeating: 0, count: Self.width * 4)
+        renderer.context.render(texture, toBitmap: &out, rowBytes: Self.width * 16,
+                                bounds: CGRect(x: 0, y: 0, width: Self.width, height: 1), format: .RGBAf,
+                                colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        var worst = 0.0
+        for x in 0..<Self.width { worst = max(worst, abs(Double(out[x * 4]) * 65535 - Double(expected[x]))) }
+        #expect(worst < 26, "within a tenth of an 8-bit step of the layer's own: worst \(worst / 257) steps")
+    }
+
+    /// The canvas dithers on its way to the 8-bit screen when a document has 16-bit or HDR layers: a tone between two
+    /// levels comes out a mix of both rather than rounded into a band, and a tone on a level (all of an 8-bit image) comes
+    /// out exactly itself.
+    @Test @MainActor func theScreenIsDitheredNotRounded() throws {
+        guard let renderer = GPUCanvasRenderer.shared else { return }
+        func shown(_ level: Double) -> [UInt8] {
+            let gray = CIImage(color: CIColor(red: level / 255, green: level / 255, blue: level / 255, alpha: 1,
+                                              colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)!)
+                .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))
+            var out = [UInt8](repeating: 0, count: 64 * 64 * 4)
+            renderer.context.render(GPUCanvasRenderer.dithered(gray), toBitmap: &out, rowBytes: 64 * 4,
+                                    bounds: CGRect(x: 0, y: 0, width: 64, height: 64), format: .RGBA8,
+                                    colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+            return stride(from: 0, to: out.count, by: 4).map { out[$0] }
+        }
+        #expect(Set(shown(100)) == [100], "a tone on a level is left exactly as it is")
+        let between = shown(100.5)
+        let high = Double(between.filter { $0 == 101 }.count) / Double(between.count)
+        #expect(Set(between) == [100, 101] && abs(high - 0.5) < 0.15, "halfway: half of each, \(Int(high * 100))% up")
     }
 
     /// A version-11 project can't carry 16-bit pixels: older builds would misread them.

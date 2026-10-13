@@ -119,11 +119,12 @@ nonisolated enum DeepLayer {
         return image
     }
 
-    /// An HDR layer whole, for the canvas to draw with its highlights: its pixels, or once it's painted, those with the
-    /// paint laid on (`flattened`), made once per version of the layer and kept for the last few, as the canvas asks
-    /// every frame. Nil for any other layer.
+    /// A 16-bit or HDR layer whole, for the canvas to draw at its full depth, so an adjustment layer over it previews as
+    /// its export will be (smooth, highlights kept): its pixels, or once it's painted, those with the paint laid on
+    /// (`flattened`), made once per version of the layer and kept for the last few, as the canvas asks every frame. Nil
+    /// for an 8-bit layer.
     static func canvasImage(_ asset: ImportedImage) -> CGImage? {
-        guard asset.isHDR, let deep = asset.deep else { return nil }
+        guard let deep = asset.deep else { return nil }
         guard asset.raster != nil else { return deep }
         let key = ObjectIdentifier(asset.image)
         if let found = canvasLock.withLock({ canvasImages.first { $0.key == key }?.image }) { return found }

@@ -3,20 +3,20 @@
   <channel>
     <title>Compositor</title>
     <item>
-      <title>Version 1.4.10</title>
-      <pubDate>Sun, 11 Oct 2026 18:20:35 +0000</pubDate>
-      <sparkle:version>45</sparkle:version>
-      <sparkle:shortVersionString>1.4.10</sparkle:shortVersionString>
+      <title>Version 1.5.1</title>
+      <pubDate>Mon, 12 Oct 2026 23:16:19 +0000</pubDate>
+      <sparkle:version>47</sparkle:version>
+      <sparkle:shortVersionString>1.5.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
-      <link>https://github.com/robbietilton/Compositor/releases/tag/v1.4.10</link>
-      <changes><![CDATA[Spot Healing and Content-Aware Fill rebuilt: edges and texture carry on through what's removed
-Import a folder of images as layers, from Import Image or by dropping it on the canvas, a tab or the Dock
-Gaussian Blur: Preserve Transparency, and solid edges for a picture filling the canvas
-RAW develop adds Noise Reduction, Lens Correction and Highlight Recovery
-Opens HEIF photos from Canon, Sony and Fuji cameras (.hif, .heif)
-The Layers panel keeps everything inside it at its narrowest
-A new app icon]]></changes>
-      <enclosure url="https://github.com/robbietilton/Compositor/releases/download/v1.4.10/Compositor.dmg" sparkle:edSignature="PeNk0AaelF3JSqEiEwB1SSHd96aOpeWkilnboVABITjT+MjoiwDuFCL6B/1HezNfFNfBRiF58OicrAQO08VdCw==" length="8052868" type="application/octet-stream"/>
+      <link>https://github.com/robbietilton/Compositor/releases/tag/v1.5.1</link>
+      <changes><![CDATA[New Filter › Progressive Blur: drag two points on the canvas
+Adjustment layers over 16-bit layers now preview at full precision
+Smoother display of 16-bit and HDR layers
+16-bit layers: 16-bit PNG, TIFF, HEIF and RAW keep full precision
+Convert layers between 8-bit and 16-bit from the right-click menu
+HDR: open EXR and .hdr images, and export EXR
+CMYK: proof colors and gamut warning in View › CMYK]]></changes>
+      <enclosure url="https://github.com/robbietilton/Compositor/releases/download/v1.5.1/Compositor.dmg" sparkle:edSignature="8C909yIzWrP19zkUcys06BwSb69NT0aUcOgHHSy7NEh/ZHkA7HY1ITsXnSc6apo6CQ94U27FdfgB30ah9K5bBg==" length="8161408" type="application/octet-stream"/>
     </item>
   </channel>
 </rss>
